@@ -1,0 +1,16 @@
+# interface timeout_minutes [backend [target [tool]]]
+# By default restart only when NONE of the peers has a recent handshake.
+wg0 5
+awg0 5
+
+# OpenWrt native netifd: logical network name may differ from device name.
+# wg0 5 openwrt vpn
+# OpenWrt userspace, explicit service if auto cannot inspect the wrapper:
+# awg0 5 openwrt-service amneziawg-userspace awg
+
+# OPNsense: device, assignment identifier or a name without spaces.
+# Farm 5
+
+# Standalone Linux quick: explicitly declare config ownership.
+# wg0 5 wg-quick /etc/wireguard/wg0.conf
+# awg0 5 awg-quick /etc/amnezia/amneziawg/awg0.conf
