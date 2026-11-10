@@ -79,7 +79,7 @@ VPN на OPNsense и интерфейсы без административно�
 | OpenWrt, WG/AWG под netifd | Логическое имя или `l3_device`, VPN protocol | `ubus … down`, затем `up` |
 | OpenWrt, отдельный AWG userspace | Один работающий procd instance, wrapper с одним буквальным вызовом `amneziawg-go [-f] DEVICE` | `/etc/init.d/SERVICE restart` |
 | OPNsense WG | Активный instance в config.xml, UUID | `configctl wireguard restart UUID` |
-| OPNsense AWG | Активный instance и поддержка адресного reconfigure в плагине | `enabled=0` → Apply → `enabled=1` → Apply → filter reload |
+| OPNsense AWG | Устройство и `/usr/local/etc/amnezia/DEVICE.conf`, доступный awg-quick | Прямой `awg-quick down/up CONFIG`, группа интерфейса и filter reload |
 | Linux, wg-quick/awg-quick через systemd | Активный instance unit | `systemctl restart UNIT` |
 | Linux, NetworkManager | Активный UUID соединения интерфейса | `nmcli connection down/up uuid UUID` |
 | Linux, standalone quick | Один стандартный конфиг, нет активного известного менеджера | `wg-quick/awg-quick down/up CONFIG` |
@@ -89,29 +89,33 @@ VPN на OPNsense и интерфейсы без административно�
 
 На OPNsense можно указать `wgN`/`awgN`, assignment вроде `opt8` или имя instance
 вроде `Farm`. XML разбирает штатный PHP OPNsense; наружу возвращаются только
-device/UUID, без ключей. Остальные системы не требуют PHP. Неизвестный AWG-плагин,
-не поддерживающий адресный restart/reconfigure, автоматически не используется.
-После AWG reconfigure обновляются общие правила firewall/NAT: установленный
-AWG-плагин пропускает этот шаг, а правила могут ссылаться на уже удалённый device.
-Штатный WG OPNsense делает аналогичный reload самостоятельно. Другие VPN-instance
-при этом не перезапускаются.
+device/UUID, без ключей. Остальные системы не требуют PHP. AWG backend не загружает
+PHP-классы AWG-плагина и не вызывает его API, reconfigure или Apply. `config.xml`
+только читается для имён и ручного отключения; при standalone awg-tools без модели
+плагина достаточно устройства и стандартного конфига. Имена assignment тоже
+поддерживаются. Старые строки с UUID принимаются для совместимости; новые строки
+установщик создаёт с путём к конфигу.
 
-AWG backend воспроизводит checkbox instance и кнопку Apply: сохраняет `enabled=0`
-через штатную модель, выполняет адресный reconfigure и глобальный Apply, проверяет
-удаление device; спустя 2 секунды сохраняет `enabled=1` и повторяет оба Apply.
-Простой reconfigure включённого instance на тестовом плагине не восстанавливал
-handshake, а эта последовательность восстановила Farm за несколько секунд.
-Ключи и серверные peers не меняются. OPNsense создаёт штатные config backups.
+AWG backend вызывает `awg-quick down /usr/local/etc/amnezia/DEVICE.conf`, проверяет
+удаление device, ждёт 2 секунды и вызывает `awg-quick up` с тем же конфигом.
+Затем восстанавливает `ifconfig DEVICE group amneziawg` и выполняет штатный
+`configctl filter reload`: правила firewall/NAT должны увидеть новый device.
+Это вызов ядра OPNsense, а не AWG-плагина. Другие VPN-instance не перезапускаются.
+`enabled` и config.xml не меняются; на Farm проверены неизменность AWG-конфигурации
+и свежий handshake через две секунды после начала прямого down/up.
 
-Только для собственного незавершённого выключения watchdog записывает recovery
-record **до** изменения enabled. При ошибке/сигнале он восстанавливает enabled=1;
-после SIGKILL это делает следующий запуск cron до обычных проверок. По умолчанию
-record находится в `/conf/wg-watchdog.pending` и переживает перезагрузку.
-При явном `--state-dir` record хранится в этом каталоге. Вручную отключённый
-instance без такого record watchdog не включает. Ручной запуск восстановления:
+Для собственного незавершённого down/up watchdog записывает recovery record
+**до** удаления устройства. При ошибке/сигнале запускает отсутствующее устройство
+через `awg-quick up`; после SIGKILL это делает следующий запуск cron до обычных
+проверок. Уже поднятый device повторно не перезапускается. Ручное отключение
+instance/глобального VPN или административный DOWN отменяют recovery.
+По умолчанию record находится в `/conf/wg-watchdog.pending` и переживает reboot;
+при явном `--state-dir` — в этом каталоге. Ручной запуск восстановления:
 `wg-watchdog.sh --recover-only` (для custom state указать тот же `--state-dir`).
-Обновление/удаление через установщик сначала завершает собственный pending toggle
+Обновление/удаление через установщик сначала завершает собственный pending restart
 установленной версии, поддерживающей recovery, затем меняет файлы и cron.
+Это также завершает старый enabled-toggle при обновлении с предыдущей версии.
+Новая версия не интерпретирует старый recovery record как прямой down/up.
 
 Для нестандартного userspace-wrapper укажите сервис явно. Он должен обслуживать
 только этот туннель: указание общего сервиса перезапустит весь этот сервис.
@@ -204,10 +208,10 @@ unshare --user --map-root-user --net --mount python3 test-linux.py
 обнаружение интерфейсов и цикл install/reinstall/uninstall с нативным cron на
 OPNsense. Native AWG netifd использует тот же адаптер, что WG, но отдельно на
 реальном OpenWrt с установленным AWG protocol handler пока не проверен.
-На OPNsense подтверждены возврат handshake после off/Apply/on/Apply, сохранение
-ручного checkbox off и восстановление собственного прерванного toggle.
+На OPNsense подтверждены возврат handshake после прямого awg-quick down/up,
+неизменность config.xml и сохранение ручного отключения.
 NetworkManager и systemd units отдельно в живой сети не проверялись.
 
 `python3 test-opnsense.py` проверяет shell backend с имитацией нативных команд:
-порядок Apply, восстановление после ошибки, сохранение recovery record при
-неудачном восстановлении и запрет вмешательства в ручное отключение.
+прямой down/up без исполнения плагина, восстановление после ошибки, сохранение
+recovery record при неудаче и запрет вмешательства в ручное отключение.

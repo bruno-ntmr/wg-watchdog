@@ -26,7 +26,7 @@ while [ "$#" -gt 0 ]; do
             echo 'Usage: wg-watchdog.sh [-c FILE] [--state-dir DIR] [--dry-run] [-v]'
             echo 'Config: interface timeout_minutes [backend [target [wg|awg|awg3]]]'
             echo 'Discovery: --discover [--timeout MINUTES] (prints config; no changes)'
-            echo 'Recovery: --recover-only [--state-dir DIR] (restore interrupted OPNsense AWG toggle)'
+            echo 'Recovery: --recover-only [--state-dir DIR] (restore interrupted OPNsense AWG down/up)'
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -51,7 +51,7 @@ uuid() {
 # Only nonsecret identifiers leave PHP. PHP is part of OPNsense itself.
 opn_disabled() {
     php -r '
-    $x=@simplexml_load_file("/conf/config.xml"); if(!$x)exit(1);
+    $x=@simplexml_load_file("/conf/config.xml"); if(!$x)exit(2);
     $q=$argv[1]; $dev=$q;
     foreach($x->interfaces->children() as $k=>$v)
         if($q===(string)$k || $q===(string)$v->descr)$dev=(string)$v->if;
@@ -65,8 +65,19 @@ opn_disabled() {
                 $matches[]=[$d,(string)$model->general->enabled!=="1" || (string)$n->enabled!=="1"];
         }
     }
+    if(count($matches)>1)exit(2);
     if(count($matches)!==1 || !$matches[0][1])exit(1);
     echo $matches[0][0],"\n";
+    ' "$1" 2>/dev/null
+}
+
+opn_device() {
+    php -r '
+    $x=@simplexml_load_file("/conf/config.xml"); if(!$x)exit(1);
+    $q=$argv[1]; $dev=$q;
+    foreach($x->interfaces->children() as $k=>$v)
+        if($q===(string)$k || $q===(string)$v->descr)$dev=(string)$v->if;
+    echo $dev,"\n";
     ' "$1" 2>/dev/null
 }
 
@@ -133,9 +144,19 @@ userspace_services() {
 
 detect_backend() {
     if [ -f /etc/rc.conf ] && have configctl && [ -f /conf/config.xml ]; then
-        mapping=$(opn_resolve "$NAME") || return 1
-        set -- $mapping
-        IFACE=$1; BACKEND=$2; TARGET=$3
+        if mapping=$(opn_resolve "$NAME"); then
+            set -- $mapping
+            IFACE=$1; BACKEND=$2; TARGET=$3
+            [ "$BACKEND" != opnsense-awg ] || TARGET=/usr/local/etc/amnezia/$IFACE.conf
+            return 0
+        fi
+        # Standalone awg-tools also works without the AWG plugin/model.
+        IFACE=$(opn_device "$NAME") || return 1
+        token "$IFACE" && opn_awg_allowed "$IFACE" || return 1
+        TARGET=/usr/local/etc/amnezia/$IFACE.conf
+        have awg-quick && [ -r "$TARGET" ] || return 1
+        have awg && awg show "$IFACE" public-key >/dev/null 2>&1 || return 1
+        BACKEND=opnsense-awg
         return 0
     fi
     if [ -f /etc/openwrt_release ] && have ubus && have jsonfilter; then
@@ -194,13 +215,16 @@ validate_backend() {
     case $BACKEND in
         openwrt) have ubus && token "$TARGET" ;;
         openwrt-service) token "$TARGET" && [ -x "/etc/init.d/$TARGET" ] ;;
-        opnsense-wg|opnsense-awg)
+        opnsense-wg)
             have configctl && uuid "$TARGET" || return 1
             case $TARGET in ????????-????-4???-[89ab]???-????????????) ;; *) return 1 ;; esac
-            [ "$(opn_resolve "$IFACE")" = "$IFACE $BACKEND $TARGET" ] || return 1
-            if [ "$BACKEND" = opnsense-awg ]; then
-                grep -q 'parameters: reconfigure %s' /usr/local/opnsense/service/conf/actions.d/actions_amneziawg.conf
-            fi ;;
+            [ "$(opn_resolve "$IFACE")" = "$IFACE $BACKEND $TARGET" ] ;;
+        opnsense-awg)
+            # Older installer configs contain a UUID. Retain compatibility;
+            # restart scope is the named device and its native config file.
+            if [ "$TARGET" != "/usr/local/etc/amnezia/$IFACE.conf" ]; then uuid "$TARGET" || return 1; fi
+            TARGET=/usr/local/etc/amnezia/$IFACE.conf
+            have awg-quick && have ifconfig && [ -r "$TARGET" ] ;;
         systemd) have systemctl && token "$TARGET" ;;
         networkmanager) have nmcli && uuid "$TARGET" ;;
         wg-quick|awg-quick) have "$BACKEND" && [ -r "$TARGET" ] ;;
@@ -208,79 +232,79 @@ validate_backend() {
     esac
 }
 
-# Use the same model/save path as the instance checkbox, without touching keys.
-opn_awg_enabled() {
-    php -r '
-    require_once("script/load_phalcon.php");
-    $m=new \OPNsense\AmneziaWG\Instance(); $node=null;
-    foreach($m->instances->instance->iterateItems() as $id=>$n) {
-        if($id===$argv[1]) $node=$n;
-    }
-    if($node===null || "awg".(string)$node->instance!==$argv[2]) exit(3);
-    $current=(string)$node->enabled; $desired=$argv[3];
-    if($desired==="0") {
-        if($current!=="1" || (string)(new \OPNsense\AmneziaWG\General())->enabled!=="1") exit(3);
-    } elseif($desired!=="1") exit(1);
-    if($current===$desired) exit(0);
-    $node->enabled->setValue($desired);
-    $m->serializeToConfig();
-    \OPNsense\Core\Config::getInstance()->save("WG/AWG watchdog: instance enabled=".$desired);
-    ' "$1" "$2" "$3" >/dev/null 2>&1
-}
-
-opn_awg_apply() {
-    # Checkbox API applies this UUID; the GUI Apply button then applies globally.
-    # Global reconfigure keeps other enabled, running instances in place.
-    php -r '$x=@simplexml_load_file("/conf/config.xml"); exit($x && (string)$x->OPNsense->amneziawg->general->enabled==="1" ? 0 : 1);' >/dev/null 2>&1 || return 1
-    configctl amneziawg reconfigure "$1" >/dev/null 2>&1 || return 1
-    configctl amneziawg reconfigure >/dev/null 2>&1
-}
-
+# Restart the device directly; OPNsense XML is read only for admin intent.
 opn_pending_path() {
     if [ "$STATE" = /var/run/wg-watchdog ] && [ -f /conf/config.xml ]; then
-        # enabled=0 is persistent: its recovery record must survive reboot too.
         printf '%s\n' /conf/wg-watchdog.pending
     else printf '%s\n' "$STATE/opnsense-awg.pending"; fi
+}
+
+finish_opn_awg() {
+    ifconfig "$1" group amneziawg >/dev/null 2>&1 &&
+        configctl filter reload >/dev/null 2>&1
+}
+
+opn_awg_allowed() {
+    if opn_disabled "$1" >/dev/null; then return 1; else
+        [ "$?" = 1 ]  # enabled/unmanaged; unreadable/ambiguous intent is denied
+    fi
 }
 
 recover_opn_awg() {
     pending_path=$(opn_pending_path)
     [ -f "$pending_path" ] || return 0
-    pending_uuid=''; pending_iface=''; extra=''
-    read -r pending_uuid pending_iface extra < "$pending_path" || :
-    uuid "$pending_uuid" && token "$pending_iface" && [ -z "$extra" ] || {
-        log 'invalid OPNsense AWG recovery record; manual recovery required'; return 1;
+    pending_kind=''; pending_iface=''; extra=''
+    read -r pending_kind pending_iface extra < "$pending_path" || :
+    if [ "$pending_kind" != quick ] || ! token "$pending_iface" || [ -n "$extra" ]; then
+        log 'legacy/invalid AWG recovery record; finish recovery with the previous version before upgrading'
+        return 1
+    fi
+    if opn_disabled "$pending_iface" >/dev/null; then
+        log "$pending_iface: administrator disabled the instance; cancelling recovery"
+        rm -f "$pending_path"; return 0
+    fi
+    opn_awg_allowed "$pending_iface" || {
+        log "$pending_iface: cannot confirm enabled instance; recovery record retained"; return 1;
     }
-    log "$pending_iface: restoring enabled instance after interrupted restart"
-    opn_awg_enabled "$pending_uuid" "$pending_iface" 1 &&
-        opn_awg_apply "$pending_uuid" &&
-        ifconfig "$pending_iface" >/dev/null 2>&1 &&
-        configctl filter reload >/dev/null 2>&1 || {
+    IFACE=$pending_iface
+    if interface_up; then :; else
+        pending_status=$?
+        if [ "$pending_status" = 1 ]; then
+            log "$pending_iface: administratively down; cancelling recovery"
+            rm -f "$pending_path"; return 0
+        fi
+        log "$pending_iface: restoring device after interrupted awg-quick restart"
+        awg-quick up "/usr/local/etc/amnezia/$pending_iface.conf" >/dev/null 2>&1 || {
             log "$pending_iface: recovery FAILED; record retained for next invocation"; return 1;
         }
+    fi
+    finish_opn_awg "$pending_iface" || return 1
     rm -f "$pending_path"
 }
 
 restart_opn_awg() {
-    # Record BEFORE disabling. EXIT/signal cleanup and the next cron invocation
-    # can restore the original enabled=1 even after an uncatchable SIGKILL.
-    pending_path=$(opn_pending_path)
-    printf '%s %s\n' "$1" "$2" > "$pending_path.new.$$" || return 1
-    mv -f "$pending_path.new.$$" "$pending_path" || return 1
-    if opn_awg_enabled "$1" "$2" 0; then :; else
-        enabled_status=$?
-        # A concurrent admin disable/deletion must not be undone by recovery.
-        [ "$enabled_status" != 3 ] || rm -f "$pending_path"
-        return 1
+    IFACE=$1
+    # Re-check immediately before down; never toggle the saved enabled flag.
+    if opn_disabled "$IFACE" >/dev/null; then
+        info "$IFACE: instance disabled by administrator; skipping"; return 0
     fi
-    opn_awg_apply "$1" || return 1
-    if ifconfig "$2" >/dev/null 2>&1; then
-        log "$2: disabled Apply did not remove the interface"; return 1
+    opn_awg_allowed "$IFACE" || return 1
+    interface_up || return 1
+    pending_path=$(opn_pending_path)
+    printf 'quick %s\n' "$IFACE" > "$pending_path.new.$$" || return 1
+    mv -f "$pending_path.new.$$" "$pending_path" || return 1
+    awg-quick down "/usr/local/etc/amnezia/$IFACE.conf" >/dev/null 2>&1 || return 1
+    if ifconfig "$IFACE" >/dev/null 2>&1; then
+        log "$IFACE: awg-quick down did not remove the interface"; return 1
     fi
     sleep 2
-    opn_awg_enabled "$1" "$2" 1 && opn_awg_apply "$1" &&
-        ifconfig "$2" >/dev/null 2>&1 &&
-        configctl filter reload >/dev/null 2>&1 || return 1
+    if opn_disabled "$IFACE" >/dev/null; then
+        log "$IFACE: administrator disabled the instance during restart; leaving it off"
+        rm -f "$pending_path"; return 0
+    fi
+    opn_awg_allowed "$IFACE" || return 1
+    awg-quick up "/usr/local/etc/amnezia/$IFACE.conf" >/dev/null 2>&1 &&
+        finish_opn_awg "$IFACE" || return 1
     rm -f "$pending_path"
 }
 
@@ -293,7 +317,7 @@ restart_interface() {
         openwrt-service) "/etc/init.d/$TARGET" restart >/dev/null 2>&1 ;;
         opnsense-wg) configctl wireguard restart "$TARGET" >/dev/null 2>&1 ;;
         opnsense-awg)
-            restart_opn_awg "$TARGET" "$IFACE" ;;
+            restart_opn_awg "$IFACE" ;;
         systemd) systemctl restart "$TARGET" >/dev/null 2>&1 ;;
         networkmanager)
             nmcli connection down uuid "$TARGET" >/dev/null 2>&1 || return 1
@@ -353,6 +377,7 @@ check_interface() {
     if [ "$TARGET" = - ]; then
         case $BACKEND in
             openwrt) TARGET=$IFACE ;;
+            opnsense-awg) TARGET=/usr/local/etc/amnezia/$IFACE.conf ;;
             wg-quick) TARGET=/etc/wireguard/$IFACE.conf ;;
             awg-quick) TARGET=/etc/amnezia/amneziawg/$IFACE.conf ;;
         esac

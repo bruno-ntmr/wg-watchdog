@@ -85,7 +85,7 @@ opn_cron() {
     configctl cron restart
 }
 
-# Finish our own interrupted toggle before replacing/removing its executable.
+# Finish our own interrupted restart before replacing/removing its executable.
 # An intentionally disabled instance without a recovery record is untouched.
 if [ "$DRY" = 0 ] && [ "$PLATFORM" = opnsense ] && [ -r "$BIN" ] &&
     grep -q -- '--recover-only' "$BIN"; then
