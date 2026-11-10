@@ -58,7 +58,11 @@ awg0 5
 
 При нескольких пирах интерфейс перезапускается, только когда **ни у одного**
 нет свежего handshake. Отсутствие пиров или ошибка чтения — ошибка проверки,
-а не основание перезапускать сеть. Интерфейс, для которого CLI уже не может
+а не основание перезапускать сеть. Отключённые администратором instance/глобальный
+VPN на OPNsense и интерфейсы без административного флага `UP` пропускаются.
+`ip link down`/`ifconfig down` не считаются поломкой. Если watchdog увидел ручное
+отключение, после следующего включения предоставляется новый льготный период.
+Интерфейс, для которого CLI уже не может
 прочитать пиров, скрипт не поднимает. После первого наблюдения и каждой попытки перезапуска
 выдерживается полный таймаут, в том числе при handshake=0. Неудачная попытка
 тоже запускает cooldown. Состояние хранится в `/var/run/wg-watchdog`, без ключей.
@@ -75,7 +79,7 @@ awg0 5
 | OpenWrt, WG/AWG под netifd | Логическое имя или `l3_device`, VPN protocol | `ubus … down`, затем `up` |
 | OpenWrt, отдельный AWG userspace | Один работающий procd instance, wrapper с одним буквальным вызовом `amneziawg-go [-f] DEVICE` | `/etc/init.d/SERVICE restart` |
 | OPNsense WG | Активный instance в config.xml, UUID | `configctl wireguard restart UUID` |
-| OPNsense AWG | Активный instance и поддержка адресного reconfigure в плагине | `configctl amneziawg reconfigure UUID`, затем `configctl filter reload` |
+| OPNsense AWG | Активный instance и поддержка адресного reconfigure в плагине | `enabled=0` → Apply → `enabled=1` → Apply → filter reload |
 | Linux, wg-quick/awg-quick через systemd | Активный instance unit | `systemctl restart UNIT` |
 | Linux, NetworkManager | Активный UUID соединения интерфейса | `nmcli connection down/up uuid UUID` |
 | Linux, standalone quick | Один стандартный конфиг, нет активного известного менеджера | `wg-quick/awg-quick down/up CONFIG` |
@@ -91,6 +95,23 @@ device/UUID, без ключей. Остальные системы не тре�
 AWG-плагин пропускает этот шаг, а правила могут ссылаться на уже удалённый device.
 Штатный WG OPNsense делает аналогичный reload самостоятельно. Другие VPN-instance
 при этом не перезапускаются.
+
+AWG backend воспроизводит checkbox instance и кнопку Apply: сохраняет `enabled=0`
+через штатную модель, выполняет адресный reconfigure и глобальный Apply, проверяет
+удаление device; спустя 2 секунды сохраняет `enabled=1` и повторяет оба Apply.
+Простой reconfigure включённого instance на тестовом плагине не восстанавливал
+handshake, а эта последовательность восстановила Farm за несколько секунд.
+Ключи и серверные peers не меняются. OPNsense создаёт штатные config backups.
+
+Только для собственного незавершённого выключения watchdog записывает recovery
+record **до** изменения enabled. При ошибке/сигнале он восстанавливает enabled=1;
+после SIGKILL это делает следующий запуск cron до обычных проверок. По умолчанию
+record находится в `/conf/wg-watchdog.pending` и переживает перезагрузку.
+При явном `--state-dir` record хранится в этом каталоге. Вручную отключённый
+instance без такого record watchdog не включает. Ручной запуск восстановления:
+`wg-watchdog.sh --recover-only` (для custom state указать тот же `--state-dir`).
+Обновление/удаление через установщик сначала завершает собственный pending toggle
+установленной версии, поддерживающей recovery, затем меняет файлы и cron.
 
 Для нестандартного userspace-wrapper укажите сервис явно. Он должен обслуживать
 только этот туннель: указание общего сервиса перезапустит весь этот сервис.
@@ -183,6 +204,10 @@ unshare --user --map-root-user --net --mount python3 test-linux.py
 обнаружение интерфейсов и цикл install/reinstall/uninstall с нативным cron на
 OPNsense. Native AWG netifd использует тот же адаптер, что WG, но отдельно на
 реальном OpenWrt с установленным AWG protocol handler пока не проверен.
-Команда адресного AWG restart на OPNsense проверена; возврат handshake за один
-цикл на тестовом плагине не подтверждён. NetworkManager и systemd units отдельно
-в живой сети не проверялись.
+На OPNsense подтверждены возврат handshake после off/Apply/on/Apply, сохранение
+ручного checkbox off и восстановление собственного прерванного toggle.
+NetworkManager и systemd units отдельно в живой сети не проверялись.
+
+`python3 test-opnsense.py` проверяет shell backend с имитацией нативных команд:
+порядок Apply, восстановление после ошибки, сохранение recovery record при
+неудачном восстановлении и запрет вмешательства в ручное отключение.

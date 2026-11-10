@@ -114,6 +114,19 @@ def main():
             assert 'startup/restart grace period' in result.stderr
             assert 'stale handshake; restarting' not in result.stderr
             print('Cooldown and zero-handshake grace: PASS', flush=True)
+            # A deliberate administrative down must win over an expired timer.
+            (state / f'{client}.since').write_text(str(int(time.time()) - 1000))
+            run('ip', 'link', 'set', client, 'down')
+            result = run(*cmd)
+            assert 'interface administratively down; skipping' in result.stderr
+            flags = run('ip', '-o', 'link', 'show', 'dev', client).stdout.split('<', 1)[1].split('>', 1)[0].split(',')
+            assert 'UP' not in flags
+            assert not (state / f'{client}.since').exists()
+            run('ip', 'link', 'set', client, 'up')
+            result = run(*cmd)
+            assert 'startup/restart grace period' in result.stderr
+            assert 'stale handshake; restarting' not in result.stderr
+            print('Manual administrative down preserved; manual up gets fresh grace: PASS', flush=True)
             (state / 'lock').mkdir()
             (state / 'lock' / 'pid').write_text(str(os.getpid()))
             result = run(*cmd)

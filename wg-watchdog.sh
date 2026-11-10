@@ -11,6 +11,7 @@ STATE=/var/run/wg-watchdog
 DRY=0
 VERBOSE=0
 DISCOVER=0
+RECOVER_ONLY=0
 DEFAULT_TIMEOUT=5
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -19,11 +20,13 @@ while [ "$#" -gt 0 ]; do
         --dry-run) DRY=1; VERBOSE=1 ;;
         -v|--verbose) VERBOSE=1 ;;
         --discover) DISCOVER=1 ;;
+        --recover-only) RECOVER_ONLY=1 ;;
         --timeout) [ "$#" -ge 2 ] || exit 2; DEFAULT_TIMEOUT=$2; shift ;;
         -h|--help)
             echo 'Usage: wg-watchdog.sh [-c FILE] [--state-dir DIR] [--dry-run] [-v]'
             echo 'Config: interface timeout_minutes [backend [target [wg|awg|awg3]]]'
             echo 'Discovery: --discover [--timeout MINUTES] (prints config; no changes)'
+            echo 'Recovery: --recover-only [--state-dir DIR] (restore interrupted OPNsense AWG toggle)'
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -46,6 +49,27 @@ uuid() {
 }
 
 # Only nonsecret identifiers leave PHP. PHP is part of OPNsense itself.
+opn_disabled() {
+    php -r '
+    $x=@simplexml_load_file("/conf/config.xml"); if(!$x)exit(1);
+    $q=$argv[1]; $dev=$q;
+    foreach($x->interfaces->children() as $k=>$v)
+        if($q===(string)$k || $q===(string)$v->descr)$dev=(string)$v->if;
+    $matches=[];
+    foreach([["wireguard","wg","server/servers/server"],
+             ["amneziawg","awg","instance/instances/instance"]] as [$kind,$prefix,$path]) {
+        $model=$x->OPNsense->$kind;
+        foreach($model->xpath($path) as $n) {
+            $d=$prefix.(string)$n->instance;
+            if($dev===$d || $q===(string)$n->name)
+                $matches[]=[$d,(string)$model->general->enabled!=="1" || (string)$n->enabled!=="1"];
+        }
+    }
+    if(count($matches)!==1 || !$matches[0][1])exit(1);
+    echo $matches[0][0],"\n";
+    ' "$1" 2>/dev/null
+}
+
 opn_resolve() {
     php -r '
     $x=@simplexml_load_file("/conf/config.xml"); if (!$x) exit(1);
@@ -184,6 +208,82 @@ validate_backend() {
     esac
 }
 
+# Use the same model/save path as the instance checkbox, without touching keys.
+opn_awg_enabled() {
+    php -r '
+    require_once("script/load_phalcon.php");
+    $m=new \OPNsense\AmneziaWG\Instance(); $node=null;
+    foreach($m->instances->instance->iterateItems() as $id=>$n) {
+        if($id===$argv[1]) $node=$n;
+    }
+    if($node===null || "awg".(string)$node->instance!==$argv[2]) exit(3);
+    $current=(string)$node->enabled; $desired=$argv[3];
+    if($desired==="0") {
+        if($current!=="1" || (string)(new \OPNsense\AmneziaWG\General())->enabled!=="1") exit(3);
+    } elseif($desired!=="1") exit(1);
+    if($current===$desired) exit(0);
+    $node->enabled->setValue($desired);
+    $m->serializeToConfig();
+    \OPNsense\Core\Config::getInstance()->save("WG/AWG watchdog: instance enabled=".$desired);
+    ' "$1" "$2" "$3" >/dev/null 2>&1
+}
+
+opn_awg_apply() {
+    # Checkbox API applies this UUID; the GUI Apply button then applies globally.
+    # Global reconfigure keeps other enabled, running instances in place.
+    php -r '$x=@simplexml_load_file("/conf/config.xml"); exit($x && (string)$x->OPNsense->amneziawg->general->enabled==="1" ? 0 : 1);' >/dev/null 2>&1 || return 1
+    configctl amneziawg reconfigure "$1" >/dev/null 2>&1 || return 1
+    configctl amneziawg reconfigure >/dev/null 2>&1
+}
+
+opn_pending_path() {
+    if [ "$STATE" = /var/run/wg-watchdog ] && [ -f /conf/config.xml ]; then
+        # enabled=0 is persistent: its recovery record must survive reboot too.
+        printf '%s\n' /conf/wg-watchdog.pending
+    else printf '%s\n' "$STATE/opnsense-awg.pending"; fi
+}
+
+recover_opn_awg() {
+    pending_path=$(opn_pending_path)
+    [ -f "$pending_path" ] || return 0
+    pending_uuid=''; pending_iface=''; extra=''
+    read -r pending_uuid pending_iface extra < "$pending_path" || :
+    uuid "$pending_uuid" && token "$pending_iface" && [ -z "$extra" ] || {
+        log 'invalid OPNsense AWG recovery record; manual recovery required'; return 1;
+    }
+    log "$pending_iface: restoring enabled instance after interrupted restart"
+    opn_awg_enabled "$pending_uuid" "$pending_iface" 1 &&
+        opn_awg_apply "$pending_uuid" &&
+        ifconfig "$pending_iface" >/dev/null 2>&1 &&
+        configctl filter reload >/dev/null 2>&1 || {
+            log "$pending_iface: recovery FAILED; record retained for next invocation"; return 1;
+        }
+    rm -f "$pending_path"
+}
+
+restart_opn_awg() {
+    # Record BEFORE disabling. EXIT/signal cleanup and the next cron invocation
+    # can restore the original enabled=1 even after an uncatchable SIGKILL.
+    pending_path=$(opn_pending_path)
+    printf '%s %s\n' "$1" "$2" > "$pending_path.new.$$" || return 1
+    mv -f "$pending_path.new.$$" "$pending_path" || return 1
+    if opn_awg_enabled "$1" "$2" 0; then :; else
+        enabled_status=$?
+        # A concurrent admin disable/deletion must not be undone by recovery.
+        [ "$enabled_status" != 3 ] || rm -f "$pending_path"
+        return 1
+    fi
+    opn_awg_apply "$1" || return 1
+    if ifconfig "$2" >/dev/null 2>&1; then
+        log "$2: disabled Apply did not remove the interface"; return 1
+    fi
+    sleep 2
+    opn_awg_enabled "$1" "$2" 1 && opn_awg_apply "$1" &&
+        ifconfig "$2" >/dev/null 2>&1 &&
+        configctl filter reload >/dev/null 2>&1 || return 1
+    rm -f "$pending_path"
+}
+
 restart_interface() {
     # Do not copy tool output to logs: quick hooks may expose config secrets.
     case $BACKEND in
@@ -193,10 +293,7 @@ restart_interface() {
         openwrt-service) "/etc/init.d/$TARGET" restart >/dev/null 2>&1 ;;
         opnsense-wg) configctl wireguard restart "$TARGET" >/dev/null 2>&1 ;;
         opnsense-awg)
-            configctl amneziawg reconfigure "$TARGET" >/dev/null 2>&1 || return 1
-            # Stock OPNsense WG does this itself. The AWG plugin does not:
-            # pf/NAT rules can retain references to the destroyed interface.
-            configctl filter reload >/dev/null 2>&1 ;;
+            restart_opn_awg "$TARGET" "$IFACE" ;;
         systemd) systemctl restart "$TARGET" >/dev/null 2>&1 ;;
         networkmanager)
             nmcli connection down uuid "$TARGET" >/dev/null 2>&1 || return 1
@@ -222,6 +319,17 @@ handshake() {
     return 1
 }
 
+interface_up() {
+    link_state=''
+    if have ip; then link_state=$(ip -o link show dev "$IFACE" 2>/dev/null) || link_state=''; fi
+    if [ -z "$link_state" ] && have ifconfig; then
+        link_state=$(ifconfig "$IFACE" 2>/dev/null) || return 2
+    fi
+    case $link_state in *\<*\>*) ;; *) return 2 ;; esac
+    link_flags=${link_state#*<}; link_flags=${link_flags%%>*}
+    case ,$link_flags, in *,UP,*) return 0 ;; *) return 1 ;; esac
+}
+
 check_interface() {
     NAME=$1; minutes=$2; BACKEND=${3:-auto}; TARGET=${4:--}; TOOL=${5:-auto}
     IFACE=$NAME
@@ -231,6 +339,13 @@ check_interface() {
     minutes=$(printf '%s\n' "$minutes" | sed 's/^0*//')
     threshold=$((minutes * 60))
     case $TOOL in auto|wg|awg|awg3) ;; *) log "$NAME: invalid tool"; return 1 ;; esac
+    if [ -f /conf/config.xml ] && have configctl; then
+        if disabled_iface=$(opn_disabled "$NAME") && token "$disabled_iface"; then
+            info "$NAME: instance or VPN globally disabled by administrator; skipping"
+            [ "$DRY" = 1 ] || rm -f "$STATE/$disabled_iface.since"
+            return 0
+        fi
+    fi
     if [ "$BACKEND" = auto ]; then
         detect_backend || { log "$NAME: cannot unambiguously detect owner; specify backend and target"; return 1; }
     fi
@@ -243,6 +358,15 @@ check_interface() {
         esac
     fi
     validate_backend || { log "$NAME: backend unavailable/invalid: $BACKEND $TARGET"; return 1; }
+    if interface_up; then :; else
+        link_status=$?
+        if [ "$link_status" = 1 ]; then
+            info "$NAME: interface administratively down; skipping"
+            [ "$DRY" = 1 ] || rm -f "$STATE/$IFACE.since"
+            return 0
+        fi
+        log "$NAME: cannot read administrative interface state; skipping"; return 1
+    fi
     handshake || { log "$NAME ($IFACE): cannot read handshakes or no peers; skipping"; return 1; }
     now=$(date +%s)
     number "$now" || return 1
@@ -293,7 +417,6 @@ if [ "$DISCOVER" = 1 ]; then
     [ "$found" -gt 0 ] || exit 1
     exit 0
 fi
-[ -r "$CONFIG" ] || { log "cannot read config: $CONFIG"; exit 2; }
 if [ "$DRY" = 0 ]; then
     [ "$(id -u)" = 0 ] || { log 'run as root (or use --dry-run)'; exit 2; }
     [ ! -L "$STATE" ] || { log 'state directory must not be a symlink'; exit 2; }
@@ -312,10 +435,21 @@ if [ "$DRY" = 0 ]; then
             rmdir "$STATE/reap"
         else rmdir "$STATE/reap"; info 'another invocation holds the lock'; exit 0; fi
     fi
-    trap 'rm -f "$STATE/lock/pid"; rmdir "$STATE/lock" 2>/dev/null' 0
+    cleanup() {
+        cleanup_status=$?
+        trap - 0
+        recover_opn_awg || cleanup_status=1
+        rm -f "$STATE/lock/pid"
+        rmdir "$STATE/lock" 2>/dev/null || :
+        exit "$cleanup_status"
+    }
+    trap cleanup 0
     trap 'exit 1' 1 2 15
     printf '%s\n' "$$" > "$STATE/lock/pid" || exit 2
+    recover_opn_awg || exit 1
 fi
+[ "$RECOVER_ONLY" = 0 ] || exit 0
+[ -r "$CONFIG" ] || { log "cannot read config: $CONFIG"; exit 2; }
 result=0
 seen=' '
 while IFS= read -r line || [ -n "$line" ]; do

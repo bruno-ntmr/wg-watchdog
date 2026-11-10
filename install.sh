@@ -85,6 +85,13 @@ opn_cron() {
     configctl cron restart
 }
 
+# Finish our own interrupted toggle before replacing/removing its executable.
+# An intentionally disabled instance without a recovery record is untouched.
+if [ "$DRY" = 0 ] && [ "$PLATFORM" = opnsense ] && [ -r "$BIN" ] &&
+    grep -q -- '--recover-only' "$BIN"; then
+    sh "$BIN" --recover-only
+fi
+
 if [ "$CRON" = 1 ] && [ "$PLATFORM" != opnsense ]; then
     command -v crontab >/dev/null 2>&1 || { echo 'Install cron/crontab first, or use --no-cron.' >&2; exit 1; }
     crontab -l > "$tmp/crontab.old" 2> "$tmp/crontab.error" || {
