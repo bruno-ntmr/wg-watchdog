@@ -142,6 +142,32 @@ userspace_services() {
     done
 }
 
+detect_openwrt_backend() {
+    # Resolve either a netifd logical name or its actual L3 device.
+    matches=$(ubus call network.interface dump 2>/dev/null |
+        jsonfilter -e "@.interface[@.interface=\"$NAME\"].interface" \
+                   -e "@.interface[@.l3_device=\"$NAME\"].interface" 2>/dev/null | sort -u)
+    set -- $matches
+    [ "$#" -le 1 ] || return 1
+    if [ "$#" = 1 ]; then
+        logical=$1
+        status=$(ubus call "network.interface.$logical" status 2>/dev/null) || return 1
+        IFACE=$(printf '%s\n' "$status" | jsonfilter -e '@.l3_device')
+        proto=$(printf '%s\n' "$status" | jsonfilter -e '@.proto')
+        case $proto in
+            wireguard|amneziawg|amneziawg2|amneziawg3)
+                BACKEND=openwrt; TARGET=$logical; return 0 ;;
+        esac
+    else
+        # A procd userspace tunnel need not be registered with netifd.
+        IFACE=$NAME
+    fi
+    services=$(userspace_services)
+    set -- $services
+    [ "$#" = 1 ] || return 1
+    BACKEND=openwrt-service; TARGET=$1; return 0
+}
+
 detect_backend() {
     if [ -f /etc/rc.conf ] && have configctl && [ -f /conf/config.xml ]; then
         if mapping=$(opn_resolve "$NAME"); then
@@ -160,24 +186,8 @@ detect_backend() {
         return 0
     fi
     if [ -f /etc/openwrt_release ] && have ubus && have jsonfilter; then
-        # Resolve either a netifd logical name or its actual L3 device.
-        matches=$(ubus call network.interface dump 2>/dev/null |
-            jsonfilter -e "@.interface[@.interface=\"$NAME\"].interface" \
-                       -e "@.interface[@.l3_device=\"$NAME\"].interface" 2>/dev/null | sort -u)
-        set -- $matches
-        [ "$#" = 1 ] || return 1
-        logical=$1
-        status=$(ubus call "network.interface.$logical" status 2>/dev/null) || return 1
-        IFACE=$(printf '%s\n' "$status" | jsonfilter -e '@.l3_device')
-        proto=$(printf '%s\n' "$status" | jsonfilter -e '@.proto')
-        case $proto in
-            wireguard|amneziawg|amneziawg2|amneziawg3)
-                BACKEND=openwrt; TARGET=$logical; return 0 ;;
-        esac
-        services=$(userspace_services)
-        set -- $services
-        [ "$#" = 1 ] || return 1
-        BACKEND=openwrt-service; TARGET=$1; return 0
+        detect_openwrt_backend
+        return $?
     fi
     # Existing active managers take priority over standalone config files.
     if have nmcli; then

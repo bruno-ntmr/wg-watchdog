@@ -84,6 +84,11 @@ VPN на OPNsense и интерфейсы без административно�
 | Linux, NetworkManager | Активный UUID соединения интерфейса | `nmcli connection down/up uuid UUID` |
 | Linux, standalone quick | Один стандартный конфиг, нет активного известного менеджера | `wg-quick/awg-quick down/up CONFIG` |
 
+Отдельный procd AWG userspace обнаруживается и без регистрации устройства в netifd
+(например, management-туннель, поднятый собственным wrapper). Владелец должен
+определяться однозначно. `python3 test-openwrt.py` проверяет оба варианта userspace,
+native netifd и отказ при неоднозначном владельце.
+
 Управление через systemd-networkd пока не поддерживается: простой down/up не
 гарантирует пересоздание WireGuard netdev. Общий networkd-сервис не перезапускается.
 
